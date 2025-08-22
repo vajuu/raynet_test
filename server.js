@@ -10,30 +10,33 @@ const app = express();
 const INSECURE = process.env.INSECURE === "true";
 const httpsAgent = new https.Agent({ rejectUnauthorized: !INSECURE });
 
-/* ------------ LOGI / HEALTH ------------- */
-app.use(morgan(':date[iso] :method :url :status - :response-time ms'));
-app.get("/health", (_, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+// 👇 log i globalny fallback (DEV only)
+if (INSECURE) {
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"; // awaryjny pas bezpieczeństwa
+}
+console.log(`Bridge starting… INSECURE=${INSECURE}`);
 
-/* ------------ BODY PARSERS ------------- */
-// surowe body TYLKO dla webhooka (dla weryfikacji podpisu)
+// 👇 JEŚLI środowisko ma proxy – wyłącz je dla axios (ważne)
+axios.defaults.proxy = false;
+
+app.use(morgan(':date[iso] :method :url :status - :response-time ms'));
+app.get("/health", (_, res) => res.json({ ok: true, insecure: INSECURE, ts: new Date().toISOString() }));
+
 app.use("/facebook/webhook", express.raw({ type: "*/*", limit: "5mb" }));
-// standardowy JSON dla reszty
 app.use(express.json({ limit: "2mb" }));
 
-/** --- ENV --- **/
 const {
     PORT = 3000,
     FB_VERIFY_TOKEN,
     FB_APP_SECRET,
     FB_PAGE_TOKEN,
-    RAYNET_INSTANCE,     // np. "mojafirma"
-    RAYNET_USERNAME,     // e-mail użytkownika w Raynet
-    RAYNET_API_KEY       // API key wygenerowany w Raynet
+    RAYNET_INSTANCE,
+    RAYNET_USERNAME,
+    RAYNET_API_KEY
 } = process.env;
 
-/** --- Walidacja sygnatury FB (X-Hub-Signature-256) --- **/
 function verifyFacebookSignature(req) {
-    const signature = req.headers["x-hub-signature-256"]; // "sha256=..."
+    const signature = req.headers["x-hub-signature-256"];
     if (!signature || !FB_APP_SECRET) return false;
     const hmac = crypto.createHmac("sha256", FB_APP_SECRET);
     hmac.update(req.body);
@@ -44,18 +47,14 @@ function verifyFacebookSignature(req) {
     return crypto.timingSafeEqual(a, b);
 }
 
-/** --- FB Webhook (GET weryfikacja) --- **/
 app.get("/facebook/webhook", (req, res) => {
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
-    if (mode === "subscribe" && token === FB_VERIFY_TOKEN) {
-        return res.status(200).send(challenge);
-    }
+    if (mode === "subscribe" && token === FB_VERIFY_TOKEN) return res.status(200).send(challenge);
     return res.sendStatus(403);
 });
 
-/** --- FB Webhook (POST zdarzenia) --- **/
 app.post("/facebook/webhook", async (req, res) => {
     try {
         if (!verifyFacebookSignature(req)) return res.sendStatus(403);
@@ -70,16 +69,16 @@ app.post("/facebook/webhook", async (req, res) => {
                 const formId = change.value?.form_id;
                 if (!leadId) continue;
 
-                // 1) pobierz szczegóły leada
+                // --- Graph API
                 const graph = await axios.get(`https://graph.facebook.com/v23.0/${leadId}`, {
                     params: {
                         access_token: FB_PAGE_TOKEN,
                         fields: "created_time,ad_id,form_id,field_data,custom_disclaimer_responses"
                     },
-                    timeout: 10000,
-                    httpsAgent
+                    timeout: 15000,
+                    httpsAgent,
+                    proxy: false,               // <— KLUCZOWE
                 });
-
 
                 const fbLead = graph.data;
                 const kv = Object.fromEntries(
@@ -94,9 +93,8 @@ app.post("/facebook/webhook", async (req, res) => {
                     lastName = lastName || parts.slice(1).join(" ") || "";
                 }
 
-                // 2) payload do Raynet
                 const leadPayload = {
-                    topic: `FB Lead: ${kv.full_name || kv.name || kv.email || leadId}`, // WYMAGANE
+                    topic: `FB Lead: ${kv.full_name || kv.name || kv.email || leadId}`,
                     firstName,
                     lastName,
                     email: kv.email || "",
@@ -109,7 +107,7 @@ app.post("/facebook/webhook", async (req, res) => {
                     ].filter(Boolean).join("\n"),
                 };
 
-                // 3) utworzenie Leada w Raynet
+                // --- Raynet
                 const created = await createRaynetLead(leadPayload);
                 console.log("RAYNET Lead created:", created?.id || created);
             }
@@ -117,26 +115,36 @@ app.post("/facebook/webhook", async (req, res) => {
 
         res.sendStatus(200);
     } catch (err) {
-        console.error("Webhook error:", err?.response?.data || err.message);
+        console.error("Webhook error:", {
+            message: err?.message,
+            code: err?.code,
+            errno: err?.errno,
+            syscall: err?.syscall,
+            status: err?.response?.status,
+            data: err?.response?.data
+        });
         res.sendStatus(500);
     }
 });
 
-/** --- Raynet: tworzenie leada --- **/
 async function createRaynetLead(data) {
     const base = `https://${RAYNET_INSTANCE}.raynetcrm.com/api/v2`;
     const url = `${base}/leads`;
     const auth = Buffer.from(`${RAYNET_USERNAME}:${RAYNET_API_KEY}`).toString("base64");
 
     const resp = await axios.post(url, data, {
-        headers: { "Content-Type": "application/json", "Authorization": `Basic ${auth}` },
-        timeout: 10000,
-        httpsAgent
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Basic ${auth}`
+        },
+        timeout: 15000,
+        httpsAgent,
+        proxy: false,                   // <— KLUCZOWE
     });
 
     return resp.data;
 }
 
 app.listen(PORT, () => {
-    console.log(`Bridge listening on :${PORT}`);
+    console.log(`Bridge listening on :${PORT} (INSECURE=${INSECURE})`);
 });
