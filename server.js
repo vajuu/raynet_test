@@ -22,7 +22,7 @@ const httpsAgentStrict = new https.Agent({ rejectUnauthorized: true });
 const httpsAgentRaynet = new https.Agent({ rejectUnauthorized: !INSECURE });
 
 /* ------------ AXIOS GLOBAL ------------- */
-// Jeśli środowisko ma systemowy proxy, wyłącz go dla axios (częsta przyczyna self-signed)
+// wyłącz systemowy proxy (częsta przyczyna błędów certów)
 axios.defaults.proxy = false;
 
 console.log(`Bridge starting… INSECURE=${INSECURE}`);
@@ -69,7 +69,6 @@ function verifyFacebookSignature(req) {
 
     const a = Buffer.from(String(signature));
     const b = Buffer.from(expected);
-    // stałoczasowe porównanie
     if (a.length !== b.length) return false;
     try { return crypto.timingSafeEqual(a, b); } catch { return false; }
 }
@@ -123,11 +122,9 @@ async function fbFetchLead(leadId) {
 
 /* ------------ RAYNET: UTWORZENIE LEADA (z fallbackami) ------------- */
 async function createRaynetLead(data) {
-    // przygotuj payload minimalny + soft pola
     const payload = {
         topic: data.topic || "Lead z Facebook Lead Ads",
         note: data.note || "",
-        // pomocnicze – jeśli Raynet ignoruje, nie zaszkodzą
         firstName: data.firstName || undefined,
         lastName: data.lastName || undefined,
         email: data.email || undefined,
@@ -144,11 +141,7 @@ async function createRaynetLead(data) {
         "Authorization": `Basic ${auth}`
     };
 
-    // host Raynet (produkcja EU zwykle ma eu.raynetcrm.com; instancja ma też subdomenę)
-    // Dwa podejścia:
-    // 1) instancyjny host
     const baseInst = `https://${RAYNET_INSTANCE}.raynetcrm.com/api/v2`;
-    // 2) regionalny (jeśli u Ciebie tak działa)
     const baseEu   = `https://eu.raynetcrm.com/api/v2`;
 
     const options = {
@@ -160,11 +153,9 @@ async function createRaynetLead(data) {
     };
 
     const endpoints = [
-        // popularny wariant wg dokumentacji: /lead (liczba pojedyncza)
         { method: "post", url: `${baseInst}/lead` },
         { method: "post", url: `${baseInst}/lead/` },
         { method: "put",  url: `${baseInst}/lead/` },
-        // fallback na host regionalny (gdy instancyjny nie działa w DEV)
         { method: "post", url: `${baseEu}/lead` },
         { method: "post", url: `${baseEu}/lead/` },
         { method: "put",  url: `${baseEu}/lead/` },
@@ -274,7 +265,6 @@ app.post("/facebook/webhook", async (req, res) => {
 });
 
 /* ------------ START ------------- */
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(Number(PORT), () => {
     console.log(`🚀 Bridge listening on http://localhost:${PORT} (INSECURE=${INSECURE})`);
 });
